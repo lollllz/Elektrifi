@@ -17,6 +17,12 @@ final class SupabaseStore
         return $this->url !== '' && $this->key !== '';
     }
 
+    public function testConnection(): void
+    {
+        $this->request('GET', '/rest/v1/electricity_profiles?select=id&limit=0');
+        $this->request('GET', '/rest/v1/bill_calculations?select=id&limit=0');
+    }
+
     /** @return array<string, mixed>|null */
     public function getProfile(string $clientId): ?array
     {

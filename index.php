@@ -3,6 +3,9 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/lib/BillingCalculator.php';
 require_once __DIR__ . '/lib/SupabaseStore.php';
+require_once __DIR__ . '/lib/DatabaseConnection.php';
+require_once __DIR__ . '/lib/NeonStore.php';
+header('Cache-Control: no-store');
 
 function e(string|int|float $value): string
 {
@@ -46,6 +49,14 @@ function postProfileSource(array $profile): array
     return $source;
 }
 
+function databaseStore(?array $credentials): SupabaseStore|NeonStore
+{
+    if (($credentials['provider'] ?? '') === 'neon') return new NeonStore($credentials['connection_string']);
+    if ($credentials !== null) return new SupabaseStore($credentials['url'], $credentials['key']);
+    if (getenv('NEON_DATABASE_URL')) return new NeonStore(getenv('NEON_DATABASE_URL'));
+    return new SupabaseStore(getenv('SUPABASE_URL') ?: null, getenv('SUPABASE_SECRET_KEY') ?: null);
+}
+
 $clientId = (string) ($_COOKIE['elektrifi_client_id'] ?? '');
 if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $clientId)) {
     $clientId = uuidV4();
@@ -58,7 +69,53 @@ if (!preg_match('/^[0-9a-f]{64}$/', $csrfToken)) {
     setPrivateCookie('elektrifi_csrf', $csrfToken, time() + 86400);
 }
 
-$store = new SupabaseStore(getenv('SUPABASE_URL') ?: null, getenv('SUPABASE_SECRET_KEY') ?: null);
+$connections = new DatabaseConnection(getenv('ELEKTRIFI_CONNECTION_DIR') ?: null);
+$connectionError = null;
+$connectionNotice = null;
+$connectionToken = (string) ($_COOKIE['elektrifi_connection'] ?? '');
+$credentials = null;
+try {
+    $credentials = $connections->read($connectionToken, $clientId);
+} catch (RuntimeException $exception) {
+    $connectionError = $exception->getMessage();
+}
+$connectionUrl = $credentials['url'] ?? (getenv('SUPABASE_URL') ?: '');
+$store = databaseStore($credentials);
+$formProvider = $store instanceof NeonStore ? 'neon' : 'supabase';
+$connectionAction = $_SERVER['REQUEST_METHOD'] === 'POST' && in_array($_POST['action'] ?? '', ['connect_database', 'disconnect_database'], true);
+if ($connectionAction) {
+    if (!hash_equals($csrfToken, (string) ($_POST['csrf_token'] ?? ''))) {
+        http_response_code(403);
+        $connectionError = 'This form expired. Refresh the page and try again.';
+    } elseif ($_POST['action'] === 'disconnect_database') {
+        $connections->forget($connectionToken);
+        setPrivateCookie('elektrifi_connection', '', time() - 3600);
+        $credentials = null;
+        $connectionUrl = getenv('SUPABASE_URL') ?: '';
+        $store = databaseStore(null);
+        $formProvider = $store instanceof NeonStore ? 'neon' : 'supabase';
+        $connectionNotice = 'Your personal connection was removed. Saved bills remain in your database.';
+    } else {
+        $connectionUrl = is_string($_POST['database_url'] ?? null) ? trim($_POST['database_url']) : '';
+        $formProvider = is_string($_POST['database_provider'] ?? null) ? $_POST['database_provider'] : 'supabase';
+        try {
+            $secretField = $formProvider === 'neon' ? 'neon_connection_string' : 'database_key';
+            $candidate = DatabaseConnection::validate($connectionUrl, is_string($_POST[$secretField] ?? null) ? $_POST[$secretField] : '', $formProvider);
+            $candidateStore = databaseStore($candidate);
+            $candidateStore->testConnection();
+            $newToken = $connections->save($candidate, $clientId);
+            setPrivateCookie('elektrifi_connection', $newToken, time() + 86400);
+            $connections->forget($connectionToken);
+            $credentials = $candidate;
+            $store = $candidateStore;
+            $connectionNotice = 'Connection verified. Your profiles and bills will now save to this database.';
+        } catch (RuntimeException $exception) {
+            $connectionError = $exception->getMessage();
+        }
+        unset($_POST['database_key'], $_POST['neon_connection_string']);
+    }
+}
+$providerLabel = $store instanceof NeonStore ? 'Neon' : 'Supabase';
 $profile = BillingCalculator::defaultProfile();
 $profileRow = null;
 $history = [];
@@ -81,7 +138,18 @@ if ($store->isConfigured()) {
     }
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ($connectionAction && isset($_POST['usage']) && hash_equals($csrfToken, (string) ($_POST['csrf_token'] ?? ''))) {
+    $draft = BillingCalculator::validateProfile(postProfileSource($profile));
+    if ($draft['errors'] === []) {
+        $profile = $draft['profile'];
+        $draftUsage = BillingCalculator::validateUsage(is_array($_POST['usage']) ? $_POST['usage'] : [], $profile['tariff_tiers']);
+        $usage = $draftUsage['usage'];
+        $usageErrors = $draftUsage['errors'];
+        if ($usageErrors === [] && array_sum($usage) > 0) $result = BillingCalculator::calculate($profile, $usage);
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$connectionAction) {
     $submittedCsrf = (string) ($_POST['csrf_token'] ?? '');
     if (!hash_equals($csrfToken, $submittedCsrf)) {
         http_response_code(403);
@@ -118,8 +186,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if ($action === 'save_profile') {
                     $notice = $store->isConfigured()
-                        ? 'Your custom tariff profile has been saved to Supabase.'
-                        : 'Your profile is valid. Connect Supabase to persist it online.';
+                        ? 'Your custom tariff profile has been saved to ' . $providerLabel . '.'
+                        : 'Your profile is valid. Connect a database to persist it online.';
                 } else {
                     $usageValidation = BillingCalculator::validateUsage(
                         is_array($_POST['usage'] ?? null) ? $_POST['usage'] : [],
@@ -147,13 +215,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $currency = $profile['currency_symbol'];
 $hasErrors = $profileErrors !== [] || $usageErrors !== [];
+$submittedUsageTotal = array_sum($usage);
+$quickTotalValue = $submittedUsageTotal > 0
+    ? BillingCalculator::formatNumber((float) $submittedUsageTotal)
+    : '780';
 ?>
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Interactive domestic electricity tariff calculator with custom rates and Supabase history.">
+    <meta name="description" content="Interactive domestic electricity tariff calculator with custom rates and Supabase or Neon history.">
     <title>Elektrifi — Electricity Bill Calculator</title>
     <link rel="stylesheet" href="style.css">
 </head>
@@ -174,9 +246,13 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
     <main>
         <section class="hero" aria-labelledby="page-title">
             <div class="hero-copy">
-                <div class="eyebrow-pill"><span></span> Smart household billing</div>
+                <div class="eyebrow-pill">
+                    <span class="eyebrow-signal" aria-hidden="true"><i></i></span>
+                    <span class="eyebrow-label">Smart household billing</span>
+                    <b aria-hidden="true">MODE / HOME</b>
+                </div>
                 <h1 id="page-title">Know what every<br><em>kilowatt costs.</em></h1>
-                <p>Use the published Malaysian tariff or shape the calculator around your own currency and energy rates. Every valid bill can be saved to your private Supabase history.</p>
+                <p>Use the published Malaysian tariff or shape the calculator around your own currency and energy rates. Save your profiles and bills to your own Supabase or Neon database.</p>
             </div>
 
             <aside class="rate-card" aria-label="Current billing rules">
@@ -190,15 +266,45 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
             <div class="system-banner <?= $databaseError !== null ? 'error' : '' ?>" role="status">
                 <span class="status-dot"></span>
                 <div>
-                    <strong><?= $databaseError !== null ? 'Supabase needs attention' : 'Supabase setup required' ?></strong>
+                    <strong><?= $databaseError !== null ? e($providerLabel) . ' needs attention' : 'Database setup required' ?></strong>
                     <p><?= $databaseError !== null
                         ? e($databaseError)
-                        : 'The calculator works locally. Add SUPABASE_URL and SUPABASE_SECRET_KEY after running the included migration to save profiles and bills.' ?></p>
+                        : 'Connect Supabase or Neon below to save tariff profiles and billing history.' ?></p>
                 </div>
             </div>
         <?php else: ?>
-            <div class="system-banner connected" role="status"><span class="status-dot"></span><div><strong>Supabase connected</strong><p>Your tariff settings and recent calculations are stored online.</p></div></div>
+            <div class="system-banner connected" role="status"><span class="status-dot"></span><div><strong><?= e($providerLabel) ?> connected</strong><p>Your tariff settings and recent calculations are stored online.</p></div></div>
         <?php endif; ?>
+
+        <section class="database-panel customizer-shell" id="database-connection" aria-labelledby="database-title">
+            <details <?= !$store->isConfigured() || $connectionError !== null ? 'open' : '' ?>>
+                <summary><span class="customizer-icon" aria-hidden="true">↗</span><span><strong id="database-title">Connect your database</strong><small><?= $credentials !== null ? 'Personal ' . e($providerLabel) . ' connection · remembered for 24 hours' : ($store->isConfigured() ? 'Server ' . e($providerLabel) . ' connection active' : 'Supabase or Neon · save your rates and recent bills') ?></small></span><span class="summary-action">Manage connection</span></summary>
+                <div class="customizer-content">
+                    <?php if ($connectionError !== null): ?><div class="alert" role="alert"><?= e($connectionError) ?></div><?php endif; ?>
+                    <?php if ($connectionNotice !== null): ?><div class="notice" role="status"><?= e($connectionNotice) ?></div><?php endif; ?>
+                    <form method="post" action="#database-connection" id="database-form">
+                        <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+                        <fieldset class="provider-picker"><legend>Database provider</legend>
+                            <label><input type="radio" name="database_provider" value="supabase" <?= $formProvider !== 'neon' ? 'checked' : '' ?>> Supabase</label>
+                            <label><input type="radio" name="database_provider" value="neon" <?= $formProvider === 'neon' ? 'checked' : '' ?>> Neon</label>
+                        </fieldset>
+                        <div class="connection-fields" data-provider-fields="supabase">
+                            <label for="database-url">Supabase project URL<input type="url" id="database-url" name="database_url" placeholder="https://your-project.supabase.co" value="<?= e($connectionUrl) ?>" <?= $formProvider !== 'neon' ? 'required' : '' ?> autocomplete="off"></label>
+                            <label for="database-key">Server secret key<input type="password" id="database-key" name="database_key" placeholder="sb_secret_…" <?= $formProvider !== 'neon' ? 'required' : '' ?> autocomplete="off" spellcheck="false"><small>Sent to this PHP server only. The key is never displayed again.</small></label>
+                        </div>
+                        <div class="connection-fields neon-fields" data-provider-fields="neon">
+                            <label for="neon-connection-string">Neon connection string<input type="password" id="neon-connection-string" name="neon_connection_string" placeholder="postgresql://user:password@ep-example.region.aws.neon.tech/neondb?sslmode=require" <?= $formProvider === 'neon' ? 'required' : '' ?> autocomplete="off" spellcheck="false"><small>Copy from Neon’s Connect dialog. Both pooled and direct URLs are supported. The password stays on this PHP server.</small></label>
+                        </div>
+                        <p class="connection-help">Use a project you own and trust this server to access. Connect over HTTPS when hosted online. Each browser keeps its own connection for 24 hours.</p>
+                        <div class="customizer-actions">
+                            <?php if ($credentials !== null): ?><button class="reset-button" type="submit" name="action" value="disconnect_database" formnovalidate>Disconnect my project</button><?php endif; ?>
+                            <button class="save-button" type="submit" name="action" value="connect_database">Test & connect</button>
+                        </div>
+                    </form>
+                    <details class="database-setup"><summary>First connection? Get the table setup SQL</summary><p>Choose a provider above, then run its SQL once in that provider’s SQL Editor before connecting. For Neon, run the SQL as the database role used in your connection string.</p><button class="ghost-button" type="button" id="copy-database-sql">Copy setup SQL</button><span id="database-copy-status" role="status"></span><pre id="database-sql" data-provider-sql="supabase"><?= e((string) file_get_contents(__DIR__ . '/supabase/migrations/20261005134330_create_electricity_profiles_and_bills.sql')) ?></pre><pre data-provider-sql="neon"><?= e((string) file_get_contents(__DIR__ . '/neon/setup.sql')) ?></pre></details>
+                </div>
+            </details>
+        </section>
 
         <?php if ($notice !== null): ?>
             <div class="notice" role="status"><?= e($notice) ?></div>
@@ -208,12 +314,28 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
             <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
 
             <section class="calculator-shell" id="calculator" aria-labelledby="calculator-title">
+                <div class="power-surge" aria-hidden="true">
+                    <span class="surge-core"></span>
+                    <svg class="surge-bolt" viewBox="0 0 120 180">
+                        <path d="M70 5 24 96h36l-11 79 48-101H61L70 5Z"/>
+                    </svg>
+                </div>
                 <div class="calculator-heading">
                     <div><p class="section-kicker">Monthly consumption</p><h2 id="calculator-title">Build your usage profile</h2></div>
-                    <button class="ghost-button" type="button" id="load-example">
-                        <svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.2 2.2m8.4 8.4 2.2 2.2m0-12.8-2.2 2.2M7.8 16.2l-2.2 2.2"/></svg>
-                        Load 780 kWh example
-                    </button>
+                    <div class="quick-fill">
+                        <label for="quick-total">Quick-fill total usage</label>
+                        <div class="quick-fill-control">
+                            <div class="quick-total-input">
+                                <input type="text" inputmode="decimal" id="quick-total" value="<?= e($quickTotalValue) ?>" autocomplete="off" aria-describedby="quick-fill-status">
+                                <span>kWh</span>
+                            </div>
+                            <button class="ghost-button" type="button" id="load-example">
+                                <svg viewBox="0 0 24 24"><path d="M4 12h14m-5-5 5 5-5 5"/></svg>
+                                Distribute
+                            </button>
+                        </div>
+                        <p id="quick-fill-status" aria-live="polite">Enter any total and split it across the active tariff blocks.</p>
+                    </div>
                 </div>
 
                 <?php if ($hasErrors): ?>
@@ -223,7 +345,7 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
                 <div class="tier-grid" id="usage-fields">
                     <?php foreach ($profile['tariff_tiers'] as $index => $tier): ?>
                         <?php $error = $usageErrors['usage_' . $index] ?? null; ?>
-                        <div class="tier-field <?= $error ? 'field-error' : '' ?>" data-usage-row>
+                        <div class="tier-field <?= $error ? 'field-error' : '' ?>" data-usage-row data-tier-limit="<?= $tier['limit_kwh'] !== null ? e(BillingCalculator::formatNumber((float) $tier['limit_kwh'])) : '' ?>">
                             <span class="tier-number"><?= str_pad((string) ($index + 1), 2, '0', STR_PAD_LEFT) ?></span>
                             <div class="tier-copy">
                                 <label for="usage_<?= $index ?>"><?= e((string) $tier['label']) ?></label>
@@ -240,7 +362,8 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
 
                 <div class="form-footer">
                     <p><span class="info-icon">i</span> Complete each block before adding usage to the next.</p>
-                    <button class="primary-button" type="submit" name="action" value="calculate">Calculate current bill <svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
+                    <button class="primary-button" type="submit" name="action" value="calculate"><span>Calculate current bill</span><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
+                    <span class="calculation-status" id="calculation-status" role="status" aria-live="polite"></span>
                 </div>
             </section>
 
@@ -320,7 +443,7 @@ $hasErrors = $profileErrors !== [] || $usageErrors !== [];
 
         <?php if ($history !== []): ?>
             <section class="history-section" aria-labelledby="history-title">
-                <div><p class="section-kicker">Stored in Supabase</p><h2 id="history-title">Recent calculations</h2></div>
+                <div><p class="section-kicker">Stored in <?= e($providerLabel) ?></p><h2 id="history-title">Recent calculations</h2></div>
                 <div class="history-list">
                     <?php foreach ($history as $item): ?>
                         <article><div><strong><?= e(BillingCalculator::formatNumber((float) $item['total_kwh'])) ?> kWh</strong><span><?= e(date('d M Y, H:i', strtotime((string) $item['created_at']))) ?></span></div><strong><?= e((string) $item['currency_code']) ?> <?= number_format((float) $item['final_total'], 2) ?></strong></article>
